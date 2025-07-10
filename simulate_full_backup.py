@@ -10,7 +10,7 @@ DB_NAME = 'testdb'
 DB_USER = 'testuser'
 DB_PASS = 'testpass'
 BACKUP_FILE = 'backup.sql'
-NUM_RECORDS = 500000
+NUM_RECORDS = 50000
 
 # --- Setup Faker and DB ---
 fake = Faker()
