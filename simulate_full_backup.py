@@ -4,6 +4,7 @@ import subprocess
 import os
 import time
 import psutil
+import csv
 
 # --- Config ---
 DB_NAME = 'testdb'
@@ -13,8 +14,22 @@ INITIAL_RECORDS = 400000
 INCREMENTAL_BATCHES = 10
 RECORDS_PER_BATCH = 10000
 BACKUP_FILE = 'full_backup.sql'
+BACKUP_LOG_CSV = 'full_backup_log.csv'
+RESTORE_LOG_CSV = 'full_restore_log.csv'
+
+backup_headers = ['batch', 'records_total', 'backup_time_s', 'backup_size_MB']
+restore_headers = ['total_records', 'restore_time_s', 'cpu_before', 'cpu_after']
 
 fake = Faker()
+
+# --- Log to CSV ---
+def log_to_csv(file_path, data, headers):
+    write_header = not os.path.exists(file_path)
+    with open(file_path, mode='a', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=headers)
+        if write_header:
+            writer.writeheader()
+        writer.writerow(data)
 
 # --- DB Connection ---
 def get_conn(use_db=True):
@@ -39,7 +54,7 @@ def get_db_size():
     return size
 
 # --- Full Backup (Overwrite) ---
-def do_full_backup():
+def do_full_backup(batch_number, records_total):
     print(f"[*] Creating full backup: {BACKUP_FILE}")
     start = time.time()
     subprocess.run([
@@ -48,6 +63,15 @@ def do_full_backup():
     duration = round(time.time() - start, 2)
     size = round(os.path.getsize(BACKUP_FILE) / 1024 / 1024, 2)
     print(f"[✔] Backup completed in {duration}s, size: {size} MB")
+
+    # Log to CSV
+    log_to_csv(BACKUP_LOG_CSV, {
+        'batch': batch_number,
+        'records_total': records_total,
+        'backup_time_s': duration,
+        'backup_size_MB': size
+    }, backup_headers)
+
     return BACKUP_FILE
 
 # --- Insert Dummy Records ---
@@ -85,13 +109,14 @@ print("[✔] Initial data inserted.")
 # --- Step 2: Initial Full Backup ---
 db_size = get_db_size()
 print(f"[i] DB size before full backup: {db_size} MB")
-latest_backup = do_full_backup()
+latest_backup = do_full_backup(batch_number=0, records_total=INITIAL_RECORDS)
 
 # --- Step 3: Incremental Batches with Full Backup Overwrite ---
 for batch in range(1, INCREMENTAL_BATCHES + 1):
     print(f"[*] Inserting batch {batch} ({RECORDS_PER_BATCH} records)...")
     insert_fake_data(RECORDS_PER_BATCH)
-    latest_backup = do_full_backup()  # Overwrites previous backup
+    total_records = INITIAL_RECORDS + batch * RECORDS_PER_BATCH
+    latest_backup = do_full_backup(batch_number=batch, records_total=total_records)
 
 # --- Step 4: Simulate DB Drop ---
 print("[!] Dropping and recreating database...")
@@ -115,6 +140,15 @@ cpu_after = psutil.cpu_percent(interval=1)
 
 print(f"[✔] Restore completed in {restore_time}s")
 print(f"[i] CPU load during restore (approx): from {cpu_before}% to {cpu_after}%")
+
+# Log restore performance
+total_records = INITIAL_RECORDS + INCREMENTAL_BATCHES * RECORDS_PER_BATCH
+log_to_csv(RESTORE_LOG_CSV, {
+    'total_records': total_records,
+    'restore_time_s': restore_time,
+    'cpu_before': cpu_before,
+    'cpu_after': cpu_after
+}, restore_headers)
 
 # --- Step 6: Verify Final Row Count ---
 print("[*] Verifying recovered data...")

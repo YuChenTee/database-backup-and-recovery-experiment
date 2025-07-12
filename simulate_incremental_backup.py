@@ -4,6 +4,7 @@ import subprocess
 import os
 import time
 import psutil
+import csv
 
 # --- Config ---
 DB_NAME = 'testdb'
@@ -15,9 +16,26 @@ NUM_INITIAL_RECORDS = 400000
 NUM_INCREMENTAL_BATCHES = 10
 RECORDS_PER_BATCH = 10000
 
+# --- Log Files ---
+BACKUP_LOG_CSV = 'incremental_backup_log.csv'      # Logs full + incremental
+RESTORE_LOG_CSV = 'incremental_restore_log.csv'    # Logs restore performance
+
+# --- CSV Headers ---
+backup_headers = ['batch', 'type', 'records_inserted', 'backup_time_s', 'backup_size_MB']
+restore_headers = ['phase', 'batch', 'restore_time_s', 'cpu_before', 'cpu_after']
+
 fake = Faker()
 
-# --- Function: Connect to DB ---
+# --- Utility: Log to CSV ---
+def log_to_csv(file_path, data, headers):
+    write_header = not os.path.exists(file_path)
+    with open(file_path, mode='a', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=headers)
+        if write_header:
+            writer.writeheader()
+        writer.writerow(data)
+
+# --- DB Connection ---
 def get_conn(use_db=True):
     return mysql.connector.connect(
         host='localhost',
@@ -26,7 +44,7 @@ def get_conn(use_db=True):
         database=DB_NAME if use_db else None
     )
 
-# --- Function: Get DB Size ---
+# --- DB Size ---
 def get_db_size():
     conn = get_conn()
     cursor = conn.cursor()
@@ -65,8 +83,6 @@ conn.close()
 print("[✔] Initial data inserted.")
 
 # --- Step 2: Full Backup ---
-db_size = get_db_size()
-print(f"[i] Database size before full backup: {db_size} MB")
 print("[*] Performing full backup...")
 start_time = time.time()
 subprocess.run([
@@ -76,13 +92,22 @@ backup_duration = round(time.time() - start_time, 2)
 backup_size = round(os.path.getsize(FULL_BACKUP_FILE) / 1024 / 1024, 2)
 print(f"[✔] Full backup completed in {backup_duration}s, size: {backup_size} MB")
 
+log_to_csv(BACKUP_LOG_CSV, {
+    'batch': 0,
+    'type': 'full',
+    'records_inserted': NUM_INITIAL_RECORDS,
+    'backup_time_s': backup_duration,
+    'backup_size_MB': backup_size
+}, backup_headers)
+
 # --- Step 3: Insert Incremental Data + Binlog Backup ---
 binlogs = []
+total_inserted = NUM_INITIAL_RECORDS
 for batch in range(1, NUM_INCREMENTAL_BATCHES + 1):
     print(f"[*] Flushing logs before batch {batch}...")
     conn = get_conn()
     cursor = conn.cursor()
-    cursor.execute("FLUSH LOGS")  # Start a new binlog for this batch
+    cursor.execute("FLUSH LOGS")
     cursor.execute("SHOW MASTER STATUS")
     log_file_before, log_pos = cursor.fetchone()[0:2]
 
@@ -106,6 +131,16 @@ for batch in range(1, NUM_INCREMENTAL_BATCHES + 1):
     inc_duration = round(time.time() - start_inc_time, 2)
     inc_size = round(os.path.getsize(binlog_output) / 1024 / 1024, 2)
     print(f"[✔] Incremental backup {batch} saved: {binlog_output} (Time: {inc_duration}s, Size: {inc_size} MB)")
+
+    total_inserted += RECORDS_PER_BATCH
+    log_to_csv(BACKUP_LOG_CSV, {
+        'batch': batch,
+        'type': 'incremental',
+        'records_inserted': total_inserted,
+        'backup_time_s': inc_duration,
+        'backup_size_MB': inc_size
+    }, backup_headers)
+
     conn.close()
 
 # --- Step 4: Drop and Recreate DB ---
@@ -130,6 +165,14 @@ cpu_after = psutil.cpu_percent(interval=1)
 print(f"[✔] Full restore completed in {restore_duration}s")
 print(f"[i] CPU load during restore (approx): from {cpu_before}% to {cpu_after}%")
 
+log_to_csv(RESTORE_LOG_CSV, {
+    'phase': 'full',
+    'batch': 0,
+    'restore_time_s': restore_duration,
+    'cpu_before': cpu_before,
+    'cpu_after': cpu_after
+}, restore_headers)
+
 # --- Step 6: Apply Incremental Backups ---
 for i, binlog_file in enumerate(binlogs, 1):
     print(f"[*] Applying incremental backup {i}...")
@@ -142,6 +185,14 @@ for i, binlog_file in enumerate(binlogs, 1):
     cpu_after = psutil.cpu_percent(interval=1)
     print(f"[✔] Applied {binlog_file} in {duration}s")
     print(f"[i] CPU load during restore (approx): from {cpu_before}% to {cpu_after}%")
+
+    log_to_csv(RESTORE_LOG_CSV, {
+        'phase': 'incremental',
+        'batch': i,
+        'restore_time_s': duration,
+        'cpu_before': cpu_before,
+        'cpu_after': cpu_after
+    }, restore_headers)
 
 # --- Step 7: Verify Data ---
 print("[*] Verifying final row count...")
